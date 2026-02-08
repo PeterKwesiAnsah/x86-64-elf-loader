@@ -119,13 +119,17 @@ int main(int argc, char **args)
       if (loadseg.p_offset % page_size == 0)
       {
         map_addr = baddr + loadseg.p_offset;
-        map_addr = mmap(map_addr, mmap_length + bss_size, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, mmap_offset);
+        map_addr = mmap(map_addr, mmap_length + bss_size, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE | MAP_FIXED, fd, mmap_offset);
 
         if (map_addr == MAP_FAILED)
         {
           perror("mmap failed:mapping a file page");
           return 1;
         }
+        pt_load_cnts++;
+        // store memory and file boundaries to test relative  distance
+        *vmaddr_ptr++ = (Elf64_Addr)map_addr;
+        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         memset(map_addr + loadseg.p_filesz, '\0', bss_size);
       }
       else
@@ -133,12 +137,12 @@ int main(int argc, char **args)
         // Already covered by a mapping, but by how much??
         __int8_t *start = (__int8_t *)((size_t)baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1)));
         __int8_t *end = (__int8_t *)((size_t)map_addr + loadseg.p_offset + loadseg.p_filesz + bss_size);
+        pt_load_cnts++;
+        *vmaddr_ptr++ = ((Elf64_Addr)map_addr + loadseg.p_offset);
+        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         if (end < start)
         {
           memset(map_addr + loadseg.p_offset + loadseg.p_filesz, '\0', bss_size);
-          pt_load_cnts++;
-          *vmaddr_ptr++ = ((Elf64_Addr)map_addr + loadseg.p_offset);
-          *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
           continue;
         }
         else
@@ -146,7 +150,7 @@ int main(int argc, char **args)
           __int8_t *bss_start = map_addr + loadseg.p_offset + loadseg.p_filesz;
           // we need a new mapping
           map_addr = baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1));
-          map_addr = mmap(map_addr, end - start, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, ((mmap_offset + page_size - 1) & ~(page_size - 1)));
+          map_addr = mmap(map_addr, end - start, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE | MAP_FIXED, fd, ((mmap_offset + page_size - 1) & ~(page_size - 1)));
           if (map_addr == MAP_FAILED)
           {
             perror("mmap failed:mapping a file page");
@@ -166,16 +170,17 @@ int main(int argc, char **args)
       // load_segments with a page_aligned offset, requires a corresponding mapping. one file page -> one memory page
       if (loadseg.p_offset % page_size == 0)
       {
-        // mmap_length = ((mmap_length + 0) + page_size - 1) & ~(page_size - 1);
-        //  assert((((size_t)map_addr % page_size) == 0));
         map_addr = baddr + loadseg.p_offset;
-        map_addr = mmap(map_addr, mmap_length, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, mmap_offset);
+        map_addr = mmap(map_addr, mmap_length, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE | MAP_FIXED, fd, mmap_offset);
 
         if (map_addr == MAP_FAILED)
         {
           perror("mmap failed:mapping a file page");
           return 1;
         }
+        pt_load_cnts++;
+        *vmaddr_ptr++ = (Elf64_Addr)map_addr;
+        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
       }
       else
       {
@@ -183,19 +188,17 @@ int main(int argc, char **args)
         __int8_t *start = (__int8_t *)((size_t)baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1)));
         assert((((size_t)map_addr % page_size) == 0));
         __int8_t *end = (__int8_t *)((size_t)map_addr + loadseg.p_offset + loadseg.p_filesz + 0);
+        pt_load_cnts++;
+        *vmaddr_ptr++ = ((size_t)map_addr + loadseg.p_offset);
+        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         if (end < start)
-        {
-          pt_load_cnts++;
-          *vmaddr_ptr++ = ((size_t)map_addr + loadseg.p_offset);
-          *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
           continue;
-        }
         else
         {
           __int8_t *bss_start = map_addr + loadseg.p_offset + loadseg.p_filesz;
           // we need a new mapping
           map_addr = baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1));
-          map_addr = mmap(map_addr, (Elf64_Addr)end - (Elf64_Addr)start, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, ((mmap_offset + page_size - 1) & ~(page_size - 1)));
+          map_addr = mmap(map_addr, (Elf64_Addr)end - (Elf64_Addr)start, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE | MAP_FIXED, fd, ((mmap_offset + page_size - 1) & ~(page_size - 1)));
           if (map_addr == MAP_FAILED)
           {
             perror("mmap failed:mapping a file page");
@@ -204,10 +207,6 @@ int main(int argc, char **args)
         }
       }
     }
-
-    pt_load_cnts++;
-    *vmaddr_ptr++ = (Elf64_Addr)map_addr;
-    *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
   }
 
   // TODO: Compare the relative distances between file pages and memory mapped pages
