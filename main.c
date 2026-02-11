@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define MIN_ARG_COUNT 2
 
@@ -21,25 +22,12 @@ static int elf_pflags_to_mmap_prot(int p_flags)
 
   return prot;
 }
-
-// Usage ./loader <path-to-elf-file> [CLI args to be passed to during process
-// execution of the program]
-int main(int argc, char **args)
+// function used to load executable files, shared objects like program interp
+int LoadET(int fd, size_t page_size, char **interpath)
 {
-  pid_t childpid;
+  //printf("??");
 
-  if (argc < MIN_ARG_COUNT)
-    return 1;
-
-  const char *elfpath = args[1];
-  int fd = open(elfpath, O_RDONLY);
-
-  // Source - https://stackoverflow.com/a/6537560
-  // Posted by Hasturkun
-  // Retrieved 2026-01-30, License - CC BY-SA 3.0
-  off_t fsize;
-
-  fsize = lseek(fd, 0, SEEK_END);
+  off_t fsize = lseek(fd, 0, SEEK_END);
   __uint8_t *addr = mmap(NULL, fsize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
   if (addr == MAP_FAILED)
@@ -49,7 +37,6 @@ int main(int argc, char **args)
   }
   Elf64_Ehdr ehdr;
   memcpy(&ehdr, addr, sizeof(ehdr));
-  size_t page_size = sysconf(_SC_PAGE_SIZE);
   int sht_i = 1;
   Elf64_Xword bss_size;
   Elf64_Shdr *sht_start = (Elf64_Shdr *)(addr + ehdr.e_shoff);
@@ -62,20 +49,22 @@ int main(int argc, char **args)
 
   __uint8_t *baddr = (__uint8_t *)0;
   Elf64_Phdr *pht_start = (Elf64_Phdr *)(addr + ehdr.e_phoff);
-  __uint8_t pt_load_cnts = 1;
+
   int pht_i = 1;
   while (pht_start[pht_i].p_type != PT_LOAD)
   {
+    if (pht_start[pht_i].p_type == PT_INTERP)
+    {
+      *interpath = (char *)addr + pht_start[pht_i].p_offset;
+    }
     pht_i++;
   };
-  Elf64_Addr vmaddr[__UINT8_MAX__];
-  Elf64_Addr fpaddr[__UINT8_MAX__];
-  Elf64_Addr *vmaddr_ptr = vmaddr;
-  Elf64_Addr *fpaddr_ptr = fpaddr;
 
   __uint8_t *map_addr;
+  size_t prevfile__offset;
   // Note: This codes for PIE (ELF-DYN)
   Elf64_Phdr loadseg = pht_start[pht_i];
+  prevfile__offset = loadseg.p_offset;
   // NB:loadseg.p_filesz must be a multiple of sysconf(SC_PAGE_SIZE)
   size_t mmap_length = loadseg.p_filesz;
   // file mapping is not enough, .bss tailed loadsegment
@@ -83,15 +72,13 @@ int main(int argc, char **args)
   // Any loadable segment , that have a page_aligned offset is a file page and hence needs to have a corresponding virtual memory page
   // JUst found that, loadable segments can share memory pages/memory mappings see the fourth segment in readelf -lf main
   mmap_length = ((mmap_length + 0) + page_size - 1) & ~(page_size - 1);
-  map_addr = mmap(NULL, loadseg.p_filesz, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, loadseg.p_offset);
+  // Perhaps we need to choose a lower memory address and be intentional about about the starting addresses of our virtual memory areas to prevent clobbering(text,data,stack etc)
+  map_addr = mmap((void *)0x08048000, loadseg.p_filesz, elf_pflags_to_mmap_prot((int)loadseg.p_flags), MAP_PRIVATE, fd, loadseg.p_offset);
   if (map_addr == MAP_FAILED)
   {
     perror("mmap failed:mapping the lowest file page");
     return 1;
   }
-
-  *vmaddr_ptr++ = (Elf64_Addr)map_addr;
-  *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
 
   baddr = map_addr - (((loadseg.p_offset + page_size) - 1) & ~(page_size - 1));
   __uint8_t *p_entry = baddr + ehdr.e_entry;
@@ -126,10 +113,6 @@ int main(int argc, char **args)
           perror("mmap failed:mapping a file page");
           return 1;
         }
-        pt_load_cnts++;
-        // store memory and file boundaries to test relative  distance
-        *vmaddr_ptr++ = (Elf64_Addr)map_addr;
-        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         memset(map_addr + loadseg.p_filesz, '\0', bss_size);
       }
       else
@@ -137,11 +120,11 @@ int main(int argc, char **args)
         // Already covered by a mapping, but by how much??
         __int8_t *start = (__int8_t *)((size_t)baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1)));
         // distance between two load segs in file
-        Elf64_Off distance = (loadseg.p_offset - fpaddr_ptr[-1]);
+        Elf64_Off distance = (loadseg.p_offset - prevfile__offset);
         __int8_t *end = (__int8_t *)((size_t)map_addr + distance + loadseg.p_filesz + bss_size);
-        pt_load_cnts++;
-        *vmaddr_ptr++ = ((Elf64_Addr)map_addr + distance);
-        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
+        // pt_load_cnts++;
+        //*vmaddr_ptr++ = ((Elf64_Addr)map_addr + distance);
+        //*fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         if (end < start)
         {
           memset(map_addr + distance + loadseg.p_filesz, '\0', bss_size);
@@ -180,20 +163,14 @@ int main(int argc, char **args)
           perror("mmap failed:mapping a file page");
           return 1;
         }
-        pt_load_cnts++;
-        *vmaddr_ptr++ = (Elf64_Addr)map_addr;
-        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
       }
       else
       {
         // Already covered by a mapping, but by how much??
         __int8_t *start = (__int8_t *)((size_t)baddr + ((mmap_offset + page_size - 1) & ~(page_size - 1)));
         // distance between two load segs in file
-        Elf64_Off distance = (loadseg.p_offset - fpaddr_ptr[-1]);
+        Elf64_Off distance = (loadseg.p_offset - prevfile__offset);
         __int8_t *end = (__int8_t *)((size_t)map_addr + distance + loadseg.p_filesz + 0);
-        pt_load_cnts++;
-        *vmaddr_ptr++ = ((size_t)map_addr + (loadseg.p_offset - fpaddr_ptr[-1]));
-        *fpaddr_ptr++ = (Elf64_Addr)loadseg.p_offset;
         if (end < start)
           continue;
         else
@@ -209,14 +186,51 @@ int main(int argc, char **args)
           }
         }
       }
+      prevfile__offset = loadseg.p_offset;
     }
   }
+  close(fd);
+  // setup stack
+  // setup a memory image for program interpretor
+  //  jump to _start
+  return 0;
+}
 
-  // TODO: Compare the relative distances between file pages and memory mapped pages
-  for (pht_i = 0; pht_i + 1 < pt_load_cnts; pht_i++)
+// Usage ./loader <path-to-elf-file> [CLI args to be passed to during process
+// execution of the program]
+int main(int argc, char **args)
+{
+  pid_t childpid = 0;
+
+  if (argc < MIN_ARG_COUNT)
+    return 1;
+
+  const char *elfpath = args[1];
+  int fd = open(elfpath, O_RDONLY);
+
+  size_t page_size = sysconf(_SC_PAGE_SIZE);
+
+  if ((childpid = fork()) == 0)
   {
-    assert((vmaddr[pht_i + 1] - vmaddr[pht_i]) == (fpaddr[pht_i + 1] - fpaddr[pht_i]));
+    char *interpath = NULL;
+    int status = LoadET(fd, page_size, &interpath);
+    printf("%s\n", interpath);
+    return status;
   }
-  // TODO: suspend parent process till child process finishes
+
+  /* If we forked above, wait for the child so the parent suspends until child exits. */
+  if (childpid > 0)
+  {
+    int status = 0;
+    if (waitpid(childpid, &status, 0) == -1)
+    {
+      perror("waitpid failed");
+      return 1;
+    }
+    if (WIFEXITED(status))
+      return WEXITSTATUS(status);
+    return 0;
+  }
+
   return 0;
 }
