@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -9,6 +10,15 @@
 #include <sys/resource.h>
 
 #define MIN_ARG_COUNT 2
+
+typedef struct
+{
+  int argc;
+  int envc;
+  __uint8_t *envp;
+  __int8_t *argp;
+
+} Usr_bckd_stck;
 
 static int elf_pflags_to_mmap_prot(int p_flags)
 {
@@ -89,6 +99,9 @@ int LoadET(int fd, size_t page_size, char **interpath)
     {
       size_t bss_size = pht_start[pht_i].p_memsz - pht_start[pht_i].p_filesz;
       memset(baddr + pht_start[pht_i].p_vaddr + pht_start[pht_i].p_filesz, '\0', bss_size);
+      // TODO: set the program break at baddr + pht_start[pht_i].p_vaddr + pht_start[pht_i].p_filesz + bss_size
+      // Heap allocation grows continously and fails when there's already an existing mapping in that range
+      // need to make sure where we load the interp are thousands of pages away
     }
   }
 
@@ -99,7 +112,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
 
 // Usage ./loader <path-to-elf-file> [CLI args to be passed to during process
 // execution of the program]
-int main(int argc, char **args)
+int main(int argc, char **args, char **envp)
 {
   pid_t childpid = 0;
 
@@ -120,10 +133,54 @@ int main(int argc, char **args)
     struct rlimit lm;
     size_t stack_max_size = getrlimit(RLIMIT_STACK, &lm);
     __uint8_t *stackEnd = (size_t)0x7fff6c845000 - (stack_max_size & ~(page_size - 1));
-    //TODO: Tempororarily hold the args,env of the current process in the heap using sbreak
-    //TODO: Get size of env,args,allocate heap memory, move into heap, safely setup stack
-    //We are turning this child process into a process that executes <path-to-elf-file> [CLI args to be passed to during process. so MAP_FIXED | MAP_PRIVATE or MAP_PRIVATE
-    //Currently our stack have the necessary information we are trying to copy
+
+    Usr_bckd_stck stck = {0};
+    stck.argc = argc - 1;
+
+    int cpy_i;
+
+    char **t_args = args;
+    char **t_envp = envp;
+    // we skip the name of the executable file
+    t_args++;
+    size_t t_args_size = 0;
+    while (*t_args)
+    {
+      t_args_size = t_args_size + (strlen(*t_args) + 1);
+      t_args++;
+    }
+
+    size_t t_env_size = 0;
+    while (*t_envp)
+    {
+      t_envp = t_env_size + (strlen(*t_envp) + 1);
+      stck.envc++;
+      t_envp++;
+    }
+    __uint8_t *temp = (__uint8_t *)malloc(sizeof(Usr_bckd_stck) + t_args_size + t_env_size);
+    if (temp == NULL)
+    {
+      perror("Temporal memory allocation to hold userspace, argc,args and envp failed");
+      return 1;
+    };
+
+    // copy args
+    for (cpy_i = 1; cpy_i < stck.argc; cpy_i++)
+    {
+      memcpy(temp + sizeof(Usr_bckd_stck), args[cpy_i], t_args_size);
+    }
+    // copy env
+    for (cpy_i = 0; cpy_i < stck.envc; cpy_i++)
+    {
+      memcpy(temp + sizeof(Usr_bckd_stck) + t_args_size, envp[cpy_i], t_env_size);
+    }
+    Usr_bckd_stck *stckptr = temp;
+    stckptr->argc = stck.argc;
+    stckptr->envc = stck.envc;
+    stckptr->argp = stckptr + sizeof(Usr_bckd_stck);
+    stckptr->envp = stckptr->argp + t_args_size;
+    // We are turning this child process into a process that executes <path-to-elf-file> [CLI args to be passed to during process. so MAP_FIXED | MAP_PRIVATE or MAP_PRIVATE
+    // Currently our stack have the necessary information we are trying to copy
 
     return status;
   }
