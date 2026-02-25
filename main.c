@@ -37,7 +37,7 @@ static int elf_pflags_to_mmap_prot(int p_flags)
   return prot;
 }
 // function used to load executable files, shared objects like program interp
-int LoadET(int fd, size_t page_size, char **interpath)
+void *LoadET(int fd, size_t page_size, char **interpath)
 {
 
   off_t fsize = lseek(fd, 0, SEEK_END);
@@ -46,7 +46,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
   if (addr == MAP_FAILED)
   {
     perror("mmap failed");
-    return 1;
+    return NULL;
   }
 
   Elf64_Ehdr *ehdr = (Elf64_Ehdr *)addr;
@@ -60,7 +60,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
   {
     if (pht_start[pht_i].p_type == PT_INTERP)
     {
-      //
+      //*interpath=str
     } // else if (pht_start[pht_i].p_type == PT_GNU_STACK){
     // check to add PROT_EXEC to stack page
     // }
@@ -82,7 +82,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
   if (addr == MAP_FAILED)
   {
     perror("mmap failed");
-    return 1;
+    return NULL;
   }
   __uint8_t *baddr = segs_addr - min_vaddr;
   for (; pht_i < __UINT8_MAX__; pht_i++)
@@ -96,7 +96,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
     if (addr == MAP_FAILED)
     {
       perror("mmap failed");
-      return 1;
+      return NULL;
     }
     if (pht_start[pht_i].p_memsz > pht_start[pht_i].p_filesz)
     {
@@ -110,7 +110,7 @@ int LoadET(int fd, size_t page_size, char **interpath)
 
   close(fd);
   munmap(addr, fsize);
-  return 0;
+  return baddr;
 }
 
 // Usage ./loader <path-to-elf-file> [CLI args to be passed to during process
@@ -130,9 +130,18 @@ int main(int argc, char **args, char **envp)
   if ((childpid = fork()) == 0)
   {
     char *interpath = NULL;
-    int status = LoadET(fd, page_size, &interpath);
+    // returns the program memory image starting address
+    void *main_baddr = LoadET(fd, page_size, &interpath);
+    if (main_baddr == NULL)
+      return 1;
+    Elf64_Ehdr *main_Ehdr = (Elf64_Ehdr *)main_baddr;
+    fd = open(interpath, O_RDONLY);
+    void *interp_baddr = LoadET(fd, page_size, NULL);
+    if (main_baddr == NULL)
+      return 1;
 
 #define PROCESS_ABI_HIGHEST_ADDR 0x00007fffffffffff
+#define PROCESS_ABI_TEXT_SEG_ADDR 0x400000
 #define RANDOM_BYTES_SIZE 16
 #define AUX_VEC_SIZE (AUX_VECTOR_SIZE * sizeof(auxv_t))
 #define ITEMS_SIZE(count) (sizeof(Elf64_Addr) * count)
@@ -224,24 +233,33 @@ int main(int argc, char **args, char **envp)
       stckptr->envp += len;
     }
     *h_sp-- = NULL;
-    // We create a fixed size auxillary vector for the elf program interpretor
-    
+// We create a fixed size auxillary vector for the elf program interpretor
+#define NEW_AUX_VEV_ET(a_type, a_un) ({*h_sp--=a_un;*h_sp--=a_type; })
+    NEW_AUX_VEV_ET(AT_NOTELF, 0);
+    NEW_AUX_VEV_ET(AT_PAGESZ, page_size);
+    NEW_AUX_VEV_ET(AT_EXECFD, open(elfpath, O_RDONLY));
+    NEW_AUX_VEV_ET(AT_PHNUM, main_Ehdr->e_phnum);
+    NEW_AUX_VEV_ET(AT_BASE, (__uint8_t)interp_baddr);
+    NEW_AUX_VEV_ET(AT_ENTRY, (__uint8_t)main_baddr + main_Ehdr->e_entry);
+    NEW_AUX_VEV_ET(AT_PHENT, main_Ehdr->e_phentsize);
+    NEW_AUX_VEV_ET(AT_PHDR, (__uint8_t)main_baddr + main_Ehdr->e_phoff);
+
     // Some of the ELF Interp AuxC entries like AT_PLATFORM etc are provided by the kernel, so we can just use them and focus on entries that are ELF or interpretor specific
-    return status;
-  }
-  /* If we forked above, wait for the child so the parent suspends until child exits. */
-  if (childpid > 0)
-  {
-    int status = 0;
-    if (waitpid(childpid, &status, 0) == -1)
+    return 0;
+
+    /* If we forked above, wait for the child so the parent suspends until child exits. */
+    if (childpid > 0)
     {
-      perror("waitpid failed");
-      return 1;
+      int status = 0;
+      if (waitpid(childpid, &status, 0) == -1)
+      {
+        perror("waitpid failed");
+        return 1;
+      }
+      if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+      return 0;
     }
-    if (WIFEXITED(status))
-      return WEXITSTATUS(status);
+
     return 0;
   }
-
-  return 0;
-}
